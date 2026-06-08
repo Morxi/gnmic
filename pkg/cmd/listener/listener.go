@@ -36,6 +36,32 @@ import (
 	"github.com/openconfig/gnmic/pkg/outputs"
 )
 
+// SonicDialoutServer is the server-side interface for the SONiC gNMIDialOut service.
+// This avoids importing the sonic-gnmi module which has broken file paths.
+type SonicDialoutServer interface {
+	SonicPublish(grpc.ServerStream) error
+}
+
+// sonicDialoutServiceDesc is the gRPC service descriptor for gnmi.sonic.gNMIDialOut.
+var sonicDialoutServiceDesc = grpc.ServiceDesc{
+	ServiceName: "gnmi.sonic.gNMIDialOut",
+	HandlerType: (*SonicDialoutServer)(nil),
+	Methods:     []grpc.MethodDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Publish",
+			Handler:       sonicPublishHandler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
+	Metadata: "dial_out.proto",
+}
+
+func sonicPublishHandler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(SonicDialoutServer).SonicPublish(stream)
+}
+
 // New returns the listen command tree.
 func New(gApp *app.App) *cobra.Command {
 	cmd := &cobra.Command{
@@ -122,12 +148,28 @@ func New(gApp *app.App) *cobra.Command {
 			}
 			gApp.Logger.Info("waiting for connections", "address", gApp.Config.Address[0])
 
-			if gApp.Config.TLSKey != "" && gApp.Config.TLSCert != "" {
+			clientAuth := "request"
+			if gApp.Config.LocalFlags.ListenAllowNoClientAuth {
+				clientAuth = "request"
+			}
+
+			if gApp.Config.LocalFlags.ListenInsecure {
+				tlsConfig, err := utils.NewTLSConfig(
+					"", "", "",
+					clientAuth,
+					false, true,
+				)
+				if err != nil {
+					return err
+				}
+				opts = append(opts, grpc.Creds(credentials.NewTLS(tlsConfig)))
+				gApp.Logger.Info("TLS enabled with auto-generated self-signed certificate")
+			} else if gApp.Config.TLSKey != "" && gApp.Config.TLSCert != "" {
 				tlsConfig, err := utils.NewTLSConfig(
 					gApp.Config.TLSCa,
 					gApp.Config.TLSCert,
 					gApp.Config.TLSKey,
-					"request",
+					clientAuth,
 					false,
 					true,
 				)
@@ -139,6 +181,7 @@ func New(gApp *app.App) *cobra.Command {
 
 			server.grpcServer = grpc.NewServer(opts...)
 			nokiasros.RegisterDialoutTelemetryServer(server.grpcServer, server)
+			server.grpcServer.RegisterService(&sonicDialoutServiceDesc, server)
 
 			if gApp.Config.LocalFlags.ListenPrometheusAddress != "" {
 				grpc_prometheus.Register(server.grpcServer)
@@ -163,8 +206,12 @@ func New(gApp *app.App) *cobra.Command {
 	}
 	cmd.Flags().Uint32P("max-concurrent-streams", "", 256, "max concurrent streams gnmic can receive per transport")
 	cmd.Flags().StringP("prometheus-address", "", "", "prometheus server address")
+	cmd.Flags().BoolP("insecure", "", false, "use auto-generated self-signed TLS certificate for the listen server")
+	cmd.Flags().BoolP("allow-no-client-auth", "", false, "request but do not require a client certificate")
 	gApp.Config.FileConfig.BindPFlag("listen-max-concurrent-streams", cmd.LocalFlags().Lookup("max-concurrent-streams"))
 	gApp.Config.FileConfig.BindPFlag("listen-prometheus-address", cmd.LocalFlags().Lookup("prometheus-address"))
+	gApp.Config.FileConfig.BindPFlag("listen-insecure", cmd.LocalFlags().Lookup("insecure"))
+	gApp.Config.FileConfig.BindPFlag("listen-allow-no-client-auth", cmd.LocalFlags().Lookup("allow-no-client-auth"))
 	return cmd
 }
 
@@ -255,6 +302,78 @@ func (s *dialoutTelemetryServer) Publish(stream nokiasros.DialoutTelemetry_Publi
 				go o.Write(s.ctx, subResp, outMeta)
 			}
 
+		case *gnmi.SubscribeResponse_SyncResponse:
+			s.gApp.Logger.Info("received sync response", "sync_response", resp.SyncResponse, "source", outMeta["source"])
+		}
+	}
+	return nil
+}
+
+func (s *dialoutTelemetryServer) SonicPublish(stream grpc.ServerStream) error {
+	pr, ok := peer.FromContext(stream.Context())
+	if ok && s.gApp.Config.Debug {
+		b, err := json.Marshal(pr)
+		if err != nil {
+			s.gApp.Logger.Debug("failed to marshal peer data", "err", err)
+		} else {
+			s.gApp.Logger.Debug("received SonicPublish RPC", "peer", string(b))
+		}
+	}
+	md, ok := metadata.FromIncomingContext(stream.Context())
+	if ok && s.gApp.Config.Debug {
+		b, err := json.Marshal(md)
+		if err != nil {
+			s.gApp.Logger.Debug("failed to marshal context metadata", "err", err)
+		} else {
+			s.gApp.Logger.Debug("received http2 headers", "headers", string(b))
+		}
+	}
+	outMeta := outputs.Meta{}
+	if sn, ok := md["subscription-name"]; ok {
+		if len(sn) > 0 {
+			outMeta["subscription-name"] = sn[0]
+		}
+	}
+	outMeta["source"] = pr.Addr.String()
+	if systemName, ok := md["system-name"]; ok {
+		if len(systemName) > 0 {
+			outMeta["system-name"] = systemName[0]
+		}
+	}
+	for {
+		subResp := new(gnmi.SubscribeResponse)
+		if err := stream.RecvMsg(subResp); err != nil {
+			if err != io.EOF {
+				s.gApp.Logger.Info("gRPC sonic dialout receive error", "err", err)
+			}
+			break
+		}
+		switch resp := subResp.Response.(type) {
+		case *gnmi.SubscribeResponse_Update:
+			if s.rootDesc != nil {
+				for _, update := range resp.Update.Update {
+					switch update.Val.Value.(type) {
+					case *gnmi.TypedValue_ProtoBytes:
+						m := dynamic.NewMessage(s.rootDesc.GetFile().FindMessage("Nokia.SROS.root"))
+						err := m.Unmarshal(update.Val.GetProtoBytes())
+						if err != nil {
+							s.gApp.Logger.Info("failed to unmarshal dynamic proto message", "err", err)
+						}
+						jsondata, err := m.MarshalJSON()
+						if err != nil {
+							s.gApp.Logger.Info("failed to marshal dynamic proto message", "err", err)
+							continue
+						}
+						if s.gApp.Config.Debug {
+							s.gApp.Logger.Debug("dynamic proto JSON", "json", string(jsondata))
+						}
+						update.Val.Value = &gnmi.TypedValue_JsonVal{JsonVal: jsondata}
+					}
+				}
+			}
+			for _, o := range s.Outputs {
+				go o.Write(s.ctx, subResp, outMeta)
+			}
 		case *gnmi.SubscribeResponse_SyncResponse:
 			s.gApp.Logger.Info("received sync response", "sync_response", resp.SyncResponse, "source", outMeta["source"])
 		}

@@ -243,6 +243,8 @@ type LocalFlags struct {
 	// Listen
 	ListenMaxConcurrentStreams uint32 `mapstructure:"listen-max-concurrent-streams,omitempty" json:"listen-max-concurrent-streams,omitempty" yaml:"listen-max-concurrent-streams,omitempty"`
 	ListenPrometheusAddress    string `mapstructure:"listen-prometheus-address,omitempty" json:"listen-prometheus-address,omitempty" yaml:"listen-prometheus-address,omitempty"`
+	ListenInsecure             bool   `mapstructure:"listen-insecure,omitempty" json:"listen-insecure,omitempty" yaml:"listen-insecure,omitempty"`
+	ListenAllowNoClientAuth    bool   `mapstructure:"listen-allow-no-client-auth,omitempty" json:"listen-allow-no-client-auth,omitempty" yaml:"listen-allow-no-client-auth,omitempty"`
 	// VersionUpgrade
 	UpgradeUsePkg bool `mapstructure:"upgrade-use-pkg" json:"upgrade-use-pkg,omitempty" yaml:"upgrade-use-pkg,omitempty"`
 	// GetSet
